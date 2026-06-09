@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "football-cdf"
+version = "0.1.0"
+description = "Provider (SkillCorner / Bepro / Sportec) raw event + tracking data -> common data format (CDF) preprocessing."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "requests>=2.31",
+]
+
+[tool.setuptools.packages.find]
+include = ["football_cdf*"]
