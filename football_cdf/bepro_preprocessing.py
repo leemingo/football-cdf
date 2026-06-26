@@ -22,19 +22,32 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         5: 120 * 60.0,
     }
 
-    def __init__(self, root_dir: str, match_id: str, load_tracking: bool = True, target_fps: int = 25):
+    def __init__(self, root_dir: str, match_id: str, load_tracking: bool = True, target_fps: int = 25,
+                 version: str = "v1"):
         """
         Bepro data loader and processor.
-        Args:   
+        Args:
             root_dir: Root directory containing match data.
             match_id: Match identifier.
             load_tracking: Whether to load tracking data immediately.
-            load: Whether to load all data upon initialization.
+            target_fps: Tracking resample target (Hz).
+            version: Raw Bepro layout. ``"v1"`` is the original per-half "extract"
+                format (metadata + per-half event/frame files). ``"v2"`` is the
+                Google-Drive API export (``info.json`` / ``lineup.json`` /
+                ``event_data.json``). Both versions produce the SAME internal
+                ``self.events`` schema (with v1-format nested ``event_types``)
+                so identical downstream code (``convert_to_actions`` etc.) runs
+                unchanged.
         """
-        
+
         super().__init__()
         self.match_id = match_id
+        self.version = version
         match_path = os.path.join(root_dir, match_id)
+
+        if version == "v2":
+            self._init_v2(match_path, load_tracking, target_fps)
+            return
 
         meta_files = [f for f in os.listdir(match_path) if "metadata" in f]
         # event_files = sorted([f for f in os.listdir(match_path) if "1st Half" in f or "2nd Half" in f])
@@ -45,14 +58,14 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         self.meta_path = f"{match_path}/{meta_files[0]}"
         self.event_path = [f"{match_path}/{event_files[0]}", f"{match_path}/{event_files[1]}"]
         self.tracking_path = [f"{match_path}/{tracking_files[0]}", f"{match_path}/{tracking_files[1]}"]
-        
+
         self.raw_metadata = self.load_raw_metadata(self.meta_path)
         self.source_fps, self.ground_width, self.ground_height = self.raw_metadata["fps"], self.raw_metadata["ground_width"], self.raw_metadata["ground_height"]
         self.target_fps = target_fps  # Resample Bepro tracking to the project-wide 25 Hz target.
         self.halftime_assumption_minutes = self.DEFAULT_HALFTIME_ASSUMPTION_MINUTES
         self.match_metadata = self.extract_match_metadata(self.raw_metadata)
         self.lineup = self.load_lineup_data(self.raw_metadata, self.match_metadata)
-        
+
         self.events = self.load_event_data(self.event_path)
         self.events = self.align_event_identifier(self.lineup, self.events, self.match_id)
         self.events = self.add_score_columns(self.events, self.lineup)
@@ -62,6 +75,62 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         if load_tracking:
             self.tracking = self.load_tracking_data(self.tracking_path, self.raw_metadata, self.lineup, self.target_fps)
             self.tracking = self.align_tracking_orientations(self.lineup, self.tracking)
+
+    def _init_v2(self, match_path: str, load_tracking: bool, target_fps: int) -> None:
+        """Google-Drive (v2) initialization path.
+
+        Produces the same ``self.events`` / ``self.lineup`` / ``self.raw_metadata``
+        / ``self.match_metadata`` contract as the v1 ``__init__`` so the shared
+        downstream pipeline runs unchanged. Tracking is not available in this
+        export, so it is skipped regardless of ``load_tracking``.
+        """
+        files = os.listdir(match_path)
+
+        def _pick(substr: str) -> Optional[str]:
+            hits = sorted(f for f in files if substr in f)
+            return f"{match_path}/{hits[0]}" if hits else None
+
+        self.info_path = _pick("info")
+        self.lineup_path = _pick("lineup")
+        self.event_path = _pick("event_data")
+        assert self.info_path and self.lineup_path and self.event_path, (
+            f"Required v2 files (info/lineup/event_data) are missing in {match_path}"
+        )
+
+        self.raw_metadata = self.load_metadata_v2(self.info_path)
+        self.source_fps = self.raw_metadata.get("fps")
+        self.ground_width = self.raw_metadata.get("ground_width")
+        self.ground_height = self.raw_metadata.get("ground_height")
+        self.target_fps = target_fps
+        self.halftime_assumption_minutes = self.DEFAULT_HALFTIME_ASSUMPTION_MINUTES
+        self.match_metadata = self.extract_match_metadata_v2(self.raw_metadata)
+        home_team_id = (self.raw_metadata.get("home_team") or {}).get("team_id")
+        away_team_id = (self.raw_metadata.get("away_team") or {}).get("team_id")
+        self.lineup = self.load_lineup_data_v2(
+            self.lineup_path,
+            home_team_id=home_team_id,
+            away_team_id=away_team_id,
+            home_team_name=(self.raw_metadata.get("home_team") or {}).get("team_name"),
+            away_team_name=(self.raw_metadata.get("away_team") or {}).get("team_name"),
+        )
+
+        self.events = self.load_event_data_v2(self.event_path)
+        self.events = self.align_event_identifier(self.lineup, self.events, self.match_id)
+        self.events = self.add_score_columns(self.events, self.lineup)
+        # Drive coordinates are already attack-normalized (attacking team toward
+        # y->1, i.e. +x after the axis swap in load_event_data_v2). The GK-heuristic
+        # align_event_orientations expects absolute/team-fixed coordinates, so it
+        # does not apply here. Reproduce the v1 home-left frame deterministically:
+        # keep home as +x and flip the away team.
+        self.events = self._v2_orient_home_left(self.events)
+
+        # Tracking frames are not part of the Google-Drive export.
+        if load_tracking:
+            warnings.warn(
+                "Tracking data is not available for the Bepro v2 (Google-Drive) "
+                "format; skipping tracking load.",
+                stacklevel=2,
+            )
      
     @staticmethod
     def load_raw_metadata(meta_path: str) -> dict:
@@ -265,6 +334,423 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         lineup_df = pd.concat([home_df, away_df], ignore_index=True)
         return lineup_df
 
+    # =====================================================================
+    # v2 (Google-Drive API) loaders
+    # =====================================================================
+
+    # Map the Drive ``event_period`` enum to the v1 ``period_order`` integer.
+    _V2_PERIOD_ORDER: dict[str, int] = {
+        "FIRST_HALF": 0,
+        "SECOND_HALF": 1,
+        "FIRST_HALF_EXTRA": 2,
+        "SECOND_HALF_EXTRA": 3,
+        "PENALTY_SHOOTOUT": 4,
+    }
+
+    # Drive Pass.outcome / Shot-like outcome → v1 ``property.Outcome``.
+    _V2_PASS_OUTCOME: dict[str, str] = {
+        "Successful": "Succeeded",
+        "Unsuccessful": "Failed",
+    }
+    # Drive Shot.outcome → v1 "Shots & Goals" property.Outcome. Only "Goal"
+    # yields a SPADL success; every other (non-goal) outcome resolves to a
+    # "fail" result, and the specific label is discarded afterwards — so any
+    # unmapped Drive outcome safely defaults to a recognized fail label below.
+    _V2_SHOT_OUTCOME: dict[str, str] = {
+        "Goal": "Goals",
+        "On Target": "Shots On Target",
+        "Off Target": "Shots Off Target",
+        "Blocked": "Blocked Shots",
+        "Keeper Rush-Out": "Keeper Rush-outs",
+        "Low Quality Shot": "Shots Off Target",
+    }
+    # Drive Set Piece.sub_event_type → v1 "Set Pieces" property.Type.
+    _V2_SET_PIECE_TYPE: dict[str, str] = {
+        "Goal Kick": "Goal Kicks",
+        "Throw-In": "Throw-Ins",
+        "Corner": "Corners",
+        "Freekick": "Freekicks",
+        "Free Kick": "Freekicks",
+        "Penalty Kick": "Penalty Kicks",
+    }
+    # Drive Save.sub_event_type → v1 "Saves" property.Type.
+    _V2_SAVE_TYPE: dict[str, str] = {
+        "Catch": "Catches",
+        "Catches": "Catches",
+        "Parry": "Parries",
+        "Parries": "Parries",
+    }
+    # Drive Duel.sub_event_type → v1 "Duels" property.Type.
+    _V2_DUEL_TYPE: dict[str, str] = {
+        "Aerial": "Aerial Duels",
+        "Ground": "Physical Duels",
+        "Loose Ball": "Loose Ball Duels",
+    }
+    # Drive Tackle.outcome → v1 "Tackles" property.Outcome.
+    _V2_TACKLE_OUTCOME: dict[str, str] = {
+        "Successful": "Succeeded",
+        "Unsuccessful": "Failed",
+    }
+    # Drive Take-On.outcome → v1 "Take-on" property.Outcome.
+    _V2_TAKE_ON_OUTCOME: dict[str, str] = {
+        "Successful": "Succeeded",
+        "Unsuccessful": "Failed",
+    }
+    # Drive body_part → bodypart hint carried on the v1 property (passthrough;
+    # bepro_actions currently hardcodes foot for shots so this is informational).
+    _V2_BODY_PART: dict[str, str] = {
+        "Left Foot": "foot_left",
+        "Right Foot": "foot_right",
+        "Head": "head",
+        "Hands": "other",
+        "Upper Body": "other",
+    }
+    # Simple Drive event_type → v1 event_name (single-result / no extra property).
+    _V2_SIMPLE_EVENT_NAME: dict[str, str] = {
+        "Interception": "Interceptions",
+        "Clearance": "Clearances",
+        "Aerial Clearance": "Aerial Control",
+        "Recovery": "Recoveries",
+        "Block": "Blocks",
+        "Step-in": "Step-in",
+        "Take-On": "Take-on",
+        "Goal Conceded": "Goals Conceded",
+        "Pass Received": "Passes Received",
+        "Cross Received": "Crosses Received",
+        "Offside": "Offsides",
+        "Set Piece Defence": "Set Piece Defence",
+    }
+
+    @staticmethod
+    def load_metadata_v2(info_path: str) -> dict:
+        """Load and flatten the Drive ``info.json`` into a v1-shaped raw_metadata
+        dict (same keys ``extract_match_metadata``/``load_lineup_data`` rely on,
+        plus the bookkeeping fields used elsewhere)."""
+        with open(info_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        result = info.get("result", info) or {}
+
+        home = result.get("home_team") or {}
+        away = result.get("away_team") or {}
+        season = result.get("season") or {}
+        venue = result.get("venue") or {}
+        match_result = result.get("detail_match_result") or {}
+
+        return {
+            "match_id": result.get("id"),
+            "match_title": result.get("match_title"),
+            "match_datetime": result.get("start_time"),
+            "match_full_time": (result.get("full_time") * 60 * 1000)
+            if result.get("full_time") is not None else None,
+            "match_extra_time": result.get("extra_full_time"),
+            "competition_id": season.get("league_id"),
+            "competition_name": season.get("season_group_name"),
+            "season_id": season.get("id"),
+            "season_name": season.get("name"),
+            "home_team": {
+                "team_id": home.get("id"),
+                "team_name": home.get("name"),
+                "team_name_en": home.get("name_en"),
+            },
+            "away_team": {
+                "team_id": away.get("id"),
+                "team_name": away.get("name"),
+                "team_name_en": away.get("name_en"),
+            },
+            "match_result": {
+                "home_team_score": match_result.get("home_team_score"),
+                "away_team_score": match_result.get("away_team_score"),
+            },
+            "stadium_id": venue.get("id"),
+            "stadium_name": venue.get("display_name"),
+            "ground_width": venue.get("ground_width"),
+            "ground_height": venue.get("ground_height"),
+            # Tracking frames are absent in the Drive export.
+            "fps": None,
+        }
+
+    @staticmethod
+    def extract_match_metadata_v2(raw_metadata: dict) -> dict:
+        """v2 counterpart to ``extract_match_metadata`` (cdf_version='v2').
+
+        Reuses the v1 extractor (the v2 raw_metadata already mirrors the v1
+        shape) and only overrides the version stamp.
+        """
+        meta = BeproDataPreprocessor.extract_match_metadata(raw_metadata)
+        meta["cdf_version"] = "v2"
+        return meta
+
+    @staticmethod
+    def load_lineup_data_v2(
+        lineup_path: str,
+        *,
+        home_team_id=None,
+        away_team_id=None,
+        home_team_name=None,
+        away_team_name=None,
+    ) -> pd.DataFrame:
+        """Build the v1-format lineup DataFrame from the Drive ``lineup.json``.
+
+        The Drive lineup carries ``team_id`` per player but not an explicit
+        home/away flag, so home/away is taken from the match metadata
+        (``info.json`` home/away team ids). If those are unavailable, falls back
+        to team-id ordering (first team seen = home).
+        """
+        with open(lineup_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        players = payload.get("result", payload) or []
+
+        rows = []
+        for p in players:
+            full_name = " ".join(
+                part for part in [p.get("player_last_name"), p.get("player_name")]
+                if part
+            ).strip() or p.get("player_name")
+            rows.append({
+                "team_id": p.get("team_id"),
+                "team_name": None,  # assigned below from metadata
+                "home_away": None,  # assigned below
+                "player_id": p.get("player_id"),
+                "uniform_number": p.get("back_number"),
+                "object_id": None,  # assigned below
+                "player_name": full_name,
+                "playing_position": p.get("position_name"),
+                "starting": p.get("is_starting_lineup"),
+            })
+
+        lineup_df = pd.DataFrame(rows)
+
+        # Assign home/away from the match metadata team ids when available, else
+        # fall back to team-id ordering (first team seen = home).
+        if home_team_id is None:
+            team_order = list(dict.fromkeys(lineup_df["team_id"].tolist()))
+            home_team_id = team_order[0] if team_order else None
+        lineup_df["home_away"] = lineup_df["team_id"].apply(
+            lambda t: "home" if t == home_team_id else "away"
+        )
+        lineup_df["team_name"] = lineup_df["home_away"].map(
+            {"home": home_team_name, "away": away_team_name}
+        )
+        # object_id uses player_id (v2 may lack reliable shirt numbers per the
+        # documented contract) so it is stable for joins.
+        lineup_df["object_id"] = lineup_df.apply(
+            lambda r: f"{r['home_away']}_{r['player_id']}", axis=1
+        )
+
+        lineup_df["player_id"] = lineup_df["player_id"].astype("string")
+        lineup_df["team_id"] = lineup_df["team_id"].astype("string")
+        lineup_df["uniform_number"] = (
+            pd.to_numeric(lineup_df["uniform_number"], errors="coerce")
+            .astype("Int64")
+        )
+        return lineup_df
+
+    @staticmethod
+    def _v2_translate_event_types(event_types: list) -> list:
+        """Translate a Drive ``event_types`` list into the v1 nested format
+        ``[{event_name, property:{Outcome|Type, ...}}]``.
+
+        A single Drive row can yield multiple v1 entries (e.g. a key/assist Pass
+        emits "Passes" + "Key Passes" + "Assists"; a Set-Piece Pass emits
+        "Passes" + "Set Pieces").
+        """
+        out: list[dict] = []
+        cls = BeproDataPreprocessor
+
+        # First pass: locate the optional Set Piece descriptor so it can be
+        # attached to the co-listed Pass/Shot exactly as v1 records it.
+        set_piece_type = None
+        for et in event_types:
+            if et.get("event_type") == "Set Piece":
+                set_piece_type = cls._V2_SET_PIECE_TYPE.get(
+                    et.get("sub_event_type"), et.get("sub_event_type")
+                )
+
+        # Drive can split a single foul into two entries (a plain "Foul" plus a
+        # "Yellow Card"/"Red Card"). v1 records ONE Fouls event carrying the
+        # card Type, so collapse to the card sub-type when one is present and
+        # emit only a single Fouls entry.
+        foul_card_sub = None
+        has_plain_foul = False
+        for et in event_types:
+            if et.get("event_type") == "Foul":
+                sub = et.get("sub_event_type")
+                if sub in ("Yellow Card", "Red Card"):
+                    foul_card_sub = sub
+                else:
+                    has_plain_foul = True
+        foul_emitted = False
+
+        for et in event_types:
+            t = et.get("event_type")
+            if t == "Pass":
+                event_name = "Crosses" if et.get("cross") else "Passes"
+                prop = {"Outcome": cls._V2_PASS_OUTCOME.get(et.get("outcome"), et.get("outcome"))}
+                out.append({"event_name": event_name, "property": prop})
+                if et.get("key_pass"):
+                    out.append({"event_name": "Key Passes", "property": {}})
+                if et.get("assist"):
+                    out.append({"event_name": "Assists", "property": {}})
+            elif t == "Shot":
+                # Unmapped (rare) Drive shot outcomes default to a recognized
+                # non-goal fail label so the full-season build never raises.
+                prop = {"Outcome": cls._V2_SHOT_OUTCOME.get(et.get("outcome"), "Shots Off Target")}
+                bp = et.get("body_part")
+                if bp is not None:
+                    prop["Body Part"] = cls._V2_BODY_PART.get(bp, "other")
+                out.append({"event_name": "Shots & Goals", "property": prop})
+            elif t == "Set Piece":
+                # Emit the v1 "Set Pieces" descriptor as its own entry (matching
+                # the v1 nested format). _get_type_name reads this co-listed
+                # entry to specialize the Pass/Shot into throw_in / corner_* /
+                # freekick_* / goalkick / shot_penalty etc.
+                if set_piece_type is not None:
+                    out.append({"event_name": "Set Pieces", "property": {"Type": set_piece_type}})
+            elif t == "Tackle":
+                out.append({
+                    "event_name": "Tackles",
+                    "property": {"Outcome": cls._V2_TACKLE_OUTCOME.get(et.get("outcome"), et.get("outcome"))},
+                })
+            elif t == "Take-On":
+                out.append({
+                    "event_name": "Take-on",
+                    "property": {"Outcome": cls._V2_TAKE_ON_OUTCOME.get(et.get("outcome"), et.get("outcome"))},
+                })
+            elif t == "Duel":
+                out.append({
+                    "event_name": "Duels",
+                    "property": {"Type": cls._V2_DUEL_TYPE.get(et.get("sub_event_type"), et.get("sub_event_type"))},
+                })
+            elif t == "Save":
+                out.append({
+                    "event_name": "Saves",
+                    "property": {"Type": cls._V2_SAVE_TYPE.get(et.get("sub_event_type"), et.get("sub_event_type"))},
+                })
+            elif t == "Aerial Clearance":
+                out.append({
+                    "event_name": "Aerial Control",
+                    "property": {"Outcome": cls._V2_PASS_OUTCOME.get(et.get("outcome"), et.get("outcome"))},
+                })
+            elif t == "Foul":
+                sub = et.get("sub_event_type")
+                foul_type = {
+                    "Yellow Card": "Yellow Cards",
+                    "Red Card": "Red Cards",
+                }.get(sub, "Fouls")
+                out.append({"event_name": "Fouls", "property": {"Type": foul_type}})
+            elif t == "Foul Won":
+                out.append({"event_name": "Fouls", "property": {"Type": "Fouls Won"}})
+            elif t == "Error":
+                out.append({"event_name": "Mistakes", "property": {}})
+            elif t == "Intervention":
+                # Drive splits what the v1 extract bundles as "Tackles" into
+                # "Tackle" (70) + "Intervention" (55). Map Intervention to a
+                # v1 "Tackles" entry so totals match. Drive carries no outcome
+                # for interventions, so default to a failed tackle (matches how
+                # v1 encodes these on the cross-validated match 126306).
+                out.append({"event_name": "Tackles", "property": {"Outcome": "Failed"}})
+            elif t in cls._V2_SIMPLE_EVENT_NAME:
+                out.append({"event_name": cls._V2_SIMPLE_EVENT_NAME[t], "property": {}})
+            else:
+                # Unmapped Drive event types (Intervention, Substitution, Hit,
+                # Ball Received, Pause, ...) carry no v1 counterpart and are
+                # dropped (mirrors v1 ignoring physical-metric rows).
+                continue
+
+        return out
+
+    def _v2_orient_home_left(self, events: pd.DataFrame) -> pd.DataFrame:
+        """Orient Drive (attack-normalized) coordinates to the v1 home-left frame.
+
+        After the axis swap in ``load_event_data_v2`` the attacking team always
+        plays toward +x. To match the v1 convention (home attacks +x, away -x),
+        negate the away team's coordinates. This replaces the GK-heuristic
+        ``align_event_orientations`` for v2, which assumes absolute coordinates.
+        """
+        events = events.copy()
+        # Compare team ids numerically: some seasons serialize team_id as a float
+        # ("4648.0") while the metadata id is an int ("4648"), so a plain string
+        # equality silently matches nothing and leaves the away team un-flipped.
+        away_raw = self.match_metadata.get("away_team_id")
+        away_num = pd.to_numeric(pd.Series([away_raw]), errors="coerce").iloc[0]
+        if pd.notna(away_num):
+            away = pd.to_numeric(events["team_id"], errors="coerce") == away_num
+        else:
+            away = events["team_id"].astype("string") == str(away_raw)
+        for col in ["x", "to_x", "y", "to_y"]:
+            if col in events.columns:
+                events.loc[away, col] = -pd.to_numeric(events.loc[away, col], errors="coerce")
+        return events
+
+    @staticmethod
+    def load_event_data_v2(event_path: str) -> pd.DataFrame:
+        """Load the Drive ``event_data.json`` and emit the SAME internal schema
+        as the v1 ``load_event_data`` (nested v1-format ``event_types`` plus all
+        flat helper columns), so identical downstream code runs unchanged."""
+        with open(event_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        raw_events = payload.get("result", payload) or []
+
+        cls = BeproDataPreprocessor
+        rows = []
+        for e in raw_events:
+            raw_types = e.get("event_types") or []
+            if not raw_types:
+                # Empty event_types are junk rows (also missing team_id); skip,
+                # mirroring v1 dropping rows without an event_name.
+                continue
+            translated = cls._v2_translate_event_types(raw_types)
+            if not translated:
+                continue
+
+            rel = e.get("relative_event") or {}
+            period_order = cls._V2_PERIOD_ORDER.get(e.get("event_period"))
+
+            rows.append({
+                "period_order": period_order,
+                "event_time": e.get("event_time"),
+                "team_name": None,
+                "player_shirt_number": None,
+                "player_name": None,
+                "event_types": translated,
+                # Drive axes are SWAPPED vs the v1 "extract" format: Drive ``x``
+                # is lateral and ``y`` is goal-ward (attack-normalized — the
+                # attacking team always plays toward y->1), whereas the shared
+                # rescale below treats ``x`` as the 105 m length axis and ``y``
+                # as the 68 m width axis (as in extract). Map Drive y->length(x)
+                # and Drive x->width(y) (same for the relative-event endpoint)
+                # so shots land near the goal, matching v1.
+                "x": e.get("y"),
+                "y": e.get("x"),
+                "to_x": rel.get("y"),
+                "to_y": rel.get("x"),
+                "attack_direction": e.get("attack_direction"),
+                # v2 identifiers are present directly on the event.
+                "team_id": e.get("team_id"),
+                "player_id": e.get("player_id"),
+                "event_id": e.get("id"),
+                # Provider-supplied xg benchmark passthrough.
+                "provider_xg": e.get("xg"),
+            })
+
+        events = pd.DataFrame(rows)
+        # Drop rows lacking a usable period mapping (defensive).
+        events = events[events["period_order"].notna()].reset_index(drop=True)
+        events["period_order"] = events["period_order"].astype("int64")
+
+        events["period_id"] = events["period_order"] + 1
+        for col in ["x", "to_x"]:
+            events[col] = events[col] * PITCH_X - PITCH_X / 2
+        for col in ["y", "to_y"]:
+            events[col] = events[col] * PITCH_Y - PITCH_Y / 2
+
+        # ID dtype parity with v1 (align_event_identifier expects string ids).
+        events["team_id"] = events["team_id"].astype("string")
+        events["player_id"] = events["player_id"].astype("string")
+        events["event_id"] = events["event_id"].astype("string")
+
+        return cls._derive_event_flat_columns(events)
+
     # Priority order for determining the primary event_name of a multi-event row.
     _PRIMARY_EVENT_PRIORITY: list[str] = [
         "Passes", "Crosses", "Shots & Goals", "Take-on", "Step-in",
@@ -303,6 +789,17 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         )
         events = events[has_event_name].reset_index(drop=True)
 
+        return BeproDataPreprocessor._derive_event_flat_columns(events)
+
+    @staticmethod
+    def _derive_event_flat_columns(events: pd.DataFrame) -> pd.DataFrame:
+        """Derive flat helper columns (raw_event_type, set_piece_type, is_key_pass,
+        prop_* etc.) from the nested v1-format ``event_types`` list column.
+
+        Shared by both the v1 (``load_event_data``) and v2 (``load_event_data_v2``)
+        paths so the resulting ``self.events`` schema is identical regardless of
+        the raw source format.
+        """
         # ── Extract flat columns from event_types list ──
         priority = BeproDataPreprocessor._PRIMARY_EVENT_PRIORITY
 

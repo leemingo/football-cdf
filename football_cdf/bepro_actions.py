@@ -291,7 +291,10 @@ def _get_type_name(event_types: list) -> str:
             elif set_piece_dict.get("property", {}).get("Type") == "Penalty Kicks":
                 a = "shot_penalty"
             else:
-                raise ValueError(f"Unknown set piece type in event_types: {event_types}")
+                # A shot co-listed with another set-piece type (e.g. a shot taken
+                # directly from a corner) has no dedicated SPADL type, so it stays
+                # a plain "shot" rather than raising.
+                a = "shot"
     elif any(e["event_name"] == "Take-on" for e in event_types):
         a = "take_on"
     elif any(e["event_name"] == "Step-in" for e in event_types): # API 2025: rename Carry to Step-in
