@@ -4,6 +4,13 @@
 raw event and tracking feeds into the **Common Data Format (CDF)** described in
 [Anzer et al., "Common Data Format (CDF): A Standardized Format for Match-Data
 in Football (Soccer)"](https://arxiv.org/abs/2505.15820).
+For action-level event tables, provider events are mapped to
+[SPADL](https://socceraction.readthedocs.io/en/latest/documentation/spadl/SPADL_definitions.html)
+action conventions where the provider parser supports it.
+Sportec / DFL tracking is loaded through
+[Kloppy](https://kloppy.pysport.org/), which provides the provider parser,
+pitch-dimension normalization, and orientation transform before conversion into
+the CDF-style wide tracking table.
 
 In `open-football-analytics`, this submodule provides the preprocessing layer
 used before metric workflows such as xG, xPass, and xT.
@@ -13,8 +20,7 @@ used before metric workflows such as xG, xPass, and xT.
 | Provider | Main class / module | Notes |
 |---|---|---|
 | SkillCorner | `football_cdf.skillcorner_preprocessing.SkillcornerDataPreprocessor` | Metadata, lineup, Dynamic Events helpers, and tracking JSONL parsing. |
-| Sportec / DFL | `football_cdf.sportec_preprocessing.SportecDataPreprocessor` | Event and tracking conversion for already-extracted raw folders. |
-| Bepro | `football_cdf.bepro_preprocessing.BeproDataPreprocessor` | Provider parser utilities. |
+| Sportec / DFL | `football_cdf.sportec_preprocessing.SportecDataPreprocessor` | Event conversion, Kloppy-backed tracking loading/normalization, and SPADL-style action conversion for already-extracted raw folders. |
 | Shared CDF logic | `football_cdf.base.BaseEventTrackingPreprocessor` | Common event/tracking schema helpers. |
 
 ## Public Tutorial
@@ -32,6 +38,10 @@ It demonstrates:
   `SkillcornerDataPreprocessor`
 - SkillCorner tracking JSONL to wide CDF tracking
 - Sportec raw folder loading when the Sportec files are already extracted
+- Sportec tracking loading and coordinate/orientation normalization through
+  Kloppy
+- Sportec event conversion into SPADL-style action rows for action-sequence
+  inspection
 
 The notebook intentionally uses placeholder paths and public-data assumptions.
 
