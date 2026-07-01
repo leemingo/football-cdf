@@ -55,14 +55,14 @@ def convert_to_actions(
 	shot_fidelity_version: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Convert K-league events to SPADL actions.
+    Convert Bepro events to SPADL actions.
     """
 
     events["period_id"] = events["period_order"] + 1 
     events = events.rename(columns={"events": "event_types"})
     events = events.sort_values(["period_id", "event_time"], kind="mergesort").reset_index(drop=True) 
     
-    # 분석에 활용하지 않은 이벤트 제거: 결측치 & 중복값
+    # Remove event rows that cannot be converted reliably.
     events = _clean_events(events, remove_event_types=["HIR", "MAX_SPEED", "VHIR", 
                                                        "Assists", "Key Passes", "SPRINT", 
                                                        "Set Piece Defence", "Passes Received", "Turnover", 
@@ -71,14 +71,14 @@ def convert_to_actions(
     events = _fix_offside(events)
     events = _fix_defensive_line_support(events)    # Convert defensive_line_support to tackle or interception
 
-    # 공격 이벤트와 수비 이벤트가 동시에 발생한 경우 이를 분리합니다.
+    # Split rows that contain attacking and defensive events together.
     events = insert_defensive_actions(events, defensive_action="Interceptions")
     events = insert_defensive_actions(events, defensive_action="Tackles")
 
-    # K-league데이터셋 형태의 aciton을 SPALD형태로 변환
+    # Convert provider event labels to SPADL action labels.
     events["type_name"] = events["event_types"].apply(_get_type_name)
 
-    # 각 액션에 대해 액션 ID, 터치 부위, 결과, 끝 위치를 정의함
+    # Derive action type, body part, result, and end location fields.
     events[["type_id", "bodypart_id", "result_id"]] = events.apply(_parse_event, axis=1, result_type="expand")
 
     actions = pd.DataFrame()
@@ -101,7 +101,7 @@ def convert_to_actions(
     actions["player_id"] = events.player_id
     actions["object_id"] = events.object_id
 
-    # K-league 경기장 형태를 SPADL형태로 변환 : 68x105 -> 105x68로 변환
+    # Convert provider coordinates to the SPADL pitch convention.
     actions["start_x"] = events.x
     actions["start_y"] = events.y
     actions["end_x"] = events.to_x
@@ -123,36 +123,30 @@ def convert_to_actions(
         .reset_index(drop=True)
     )
 
-    actions = _fix_dribble(actions)  # dribble의 끝 위치를 조정
+    actions = _fix_dribble(actions)  # adjust dribble end locations
     actions = _fix_clearances(actions)
 
     actions["action_id"] = range(len(actions))
-    actions = _add_dribbles(actions) # TODO: _add_dribbles_after_receive가 더 정확하게 드리블 생성 가능함. 단, baseline을 위해 제외함
+    actions = _add_dribbles(actions)
 
     return actions
 
 def _clean_events(df_events: pd.DataFrame, remove_event_types) -> pd.DataFrame:
     """
-    데이터프레임에서 특정 이벤트 타입을 제거하는 함수.
-    remove_event_types (list): 제거할 이벤트 타입 목록
+    Remove configured event types and drop duplicate rows.
 
-    - 결측치 조건(missing_cond)
-    1.24	[Duel]	[Aerial]	...	NaN	NaN	NaN	NaN	NaN	NaN	[{'event_type': 'Duel', 'sub_event_type': 'Aerial...	NaN	NaN	35
-    67	85848	94916404	1	4641.0	259769.0	163181	0.193699	0.5342 event_types이 기록되어 있지 않는 경우 -> parsing이 불가능함, 단순히 이전 정보만으로는 예측 불가능
-    2. event_types이 기록되어 있는데, team_id & player_id정보가 기록되어 있지 않는 경우 -> 이전 정보로는 불가능하겠지만, 다음 정보로는 가능함.
-    
-    - 중복 데이터(duplicated_cond)
-    1. event_id가 중복되는 경우 -> 제거
-    2. event_id는 다른데 그 외 데이터가 중복되는 경우 -> 제거
+    Rows with no remaining event labels cannot be parsed. Duplicate rows are
+    detected across the full event payload after converting nested list/dict
+    values to strings.
     """
 
-    # 해당 이벤트만 제거
+    # Remove only the configured event labels from multi-label rows.
     # ex) Pass + Control Under Pressure -> Pass 
     df_events["event_types"] = df_events["event_types"].apply(
         lambda event_list: [event for event in event_list if ("event_name" in event.keys()) and (event["event_name"] not in remove_event_types)]
     )
 
-    # 처음부터 빈 리스트이거나 제거하므로써 remove_event_types로 인해 빈 리스트가 된 행 제거
+    # Drop rows that have no convertible event labels after filtering.
     missing_cond = (
         (df_events['event_types'].apply(len) == 0)
         # | (events["team_id"].isna())   # we do not remove missing team_id to better capture the context
@@ -160,14 +154,14 @@ def _clean_events(df_events: pd.DataFrame, remove_event_types) -> pd.DataFrame:
     )
     df_events = df_events[~missing_cond].reset_index(drop=True)
 
-    # keep=fist: 중복된 데이터 중 첫번째 데이터만 남기고 나머지 제거(첫번째 데이터만 False)
+    # Keep the first occurrence of duplicate event payloads.
     df = df_events.copy()
 
-    # duplicated_cond2: event_id는 다른데 그 외 데이터가 모두 중복되는 경우
+    # Detect duplicate payloads, including cases where event_id differs.
     event_cols = df_events.columns.tolist()
     for col in event_cols:
-        df[col] = df[col].apply(lambda x: str(x) if isinstance(x, list) or isinstance(x, dict) else x) # duplicated함수는 list, dict를 지원하지 않음
-    duplicated_cond = df.duplicated(subset=event_cols, keep="first") # 첫번째 데이터만 False -> ~False=True
+        df[col] = df[col].apply(lambda x: str(x) if isinstance(x, list) or isinstance(x, dict) else x)
+    duplicated_cond = df.duplicated(subset=event_cols, keep="first")
     
     return df_events[~duplicated_cond].reset_index(drop=True)
 
@@ -299,7 +293,7 @@ def _get_type_name(event_types: list) -> str:
         a = "take_on"
     elif any(e["event_name"] == "Step-in" for e in event_types): # API 2025: rename Carry to Step-in
         a = "dribble"
-    elif any(e["event_name"] == "Saves" for e in event_types): # 골키퍼 액션 : Save, Aerial Clearnce, Defensive Line Support Succeeded
+    elif any(e["event_name"] == "Saves" for e in event_types):
         save_dict = next(e for e in event_types if e.get("event_name") == "Saves")
         if save_dict.get("property", {}).get("Type") == "Catches":
             a = "keeper_save"
@@ -309,7 +303,7 @@ def _get_type_name(event_types: list) -> str:
             raise ValueError(f"Unknown save type in event_types: {event_types}")
     elif any(e["event_name"] == "Aerial Control" for e in event_types):  
         aerial_control_dict = next(e for e in event_types if e.get("event_name") == "Aerial Control")
-        # 실패한 Aerial Clearance는 공의 방향에 영향을 미치지 않으므로 non_action으로 처리
+        # Failed aerial clearances do not change the ball direction.
         if aerial_control_dict.get("property", {}).get("Outcome") == "Succeeded":
             a = "keeper_claim"
         else:
@@ -321,7 +315,7 @@ def _get_type_name(event_types: list) -> str:
         if foul_dict.get("property", {}).get("Type") in ["Fouls", "Yellow Cards", "Red Cards", "Handball Foul", "Foul Throw"]:
             a = "foul"
         elif foul_dict.get("property", {}).get("Type") == "Fouls Won":
-            a = "non_action" # 상대팀의 파울 유도는 non_action으로 정의
+            a = "non_action"
         elif foul_dict.get("property", {}).get("Penalty Kick Won") == "True":
             a = "non_action" 
         else:
@@ -346,8 +340,8 @@ def _fix_defensive_line_support(df_events: pd.DataFrame) -> pd.DataFrame:
     cond_tackle = df_events["event_types"].apply(lambda x: any(e.get("event_name") == "Tackles" for e in x))
     same_player = df_events.player_id == df_events_next.player_id
 
-    cond_interception = cond_defensive_line_support & same_player & ~cond_tackle # 수비 액션 이후 공을 소유하는 경우, Interception으로 정의
-    cond_tackle = cond_defensive_line_support & (~same_player | cond_tackle)  # 수비 액션 이후 공을 소유하지 않는 경우, Tackle로 정의
+    cond_interception = cond_defensive_line_support & same_player & ~cond_tackle
+    cond_tackle = cond_defensive_line_support & (~same_player | cond_tackle)
 
     df_events.loc[cond_interception , "event_types"] = df_events.loc[cond_interception , "event_types"].apply(
         lambda event_list: event_list + [{"event_name": "Interceptions"}]
@@ -410,8 +404,7 @@ def _fix_dribble(df_actions: pd.DataFrame) -> pd.DataFrame:
         (df_actions.team_id != df_actions_next.team_id)
     )
 
-    # next_actions: 실패한 태클이 아닌 다음 이벤트의 위치를 드리블의 끝 위치로 보간
-    # ex) dribble(A팀) -> tackle(B팀, fail) -> pass(A팀)의 경우, dribble의 끝 위치는 pass의 시작 위치로 정의
+    # Use the next non-failed-tackle event location as the dribble end point.
     next_actions = df_actions_next.mask(failed_defensive)[["start_x", "start_y"]].bfill()
 
     cond_dribble = df_actions.type_id == actiontypes.index("dribble")
@@ -447,9 +440,9 @@ def _add_dribbles(actions: pd.DataFrame,
         next_actions.bodypart_id != bodyparts.index("head")
     )
 
-    # bad_touch를 한 경우
+    # Bad-touch case.
     not_bad_touch = (next_actions.type_id != actiontypes.index("bad_touch")) 
-    # 동일한 사람이 연속으로 드리블하는 상황X
+    # Exclude consecutive dribbles by the same player.
     not_dribble = (next_actions.type_id != actiontypes.index("dribble")) & (
         next_actions.type_id != actiontypes.index("take_on")
     )
@@ -500,12 +493,12 @@ def _add_dribbles(actions: pd.DataFrame,
     actions["action_id"] = range(len(actions))
     return actions
 
-# 공격 이벤트와 수비 이벤트가 함께 존재하는지 확인하는 함수
+# Check whether a row contains both attacking and defensive events.
 def insert_defensive_actions(df_events: pd.DataFrame, defensive_action : str) -> pd.DataFrame:
     """Insert defensive actions before offensive actions when both occur at the same time."""
 
     def is_attack_and_defense(event_types : list) -> bool:
-        has_attack = any(e.get("event_name") in ["Passes", "Crosses", "Shots & Goals", "Take-on", "Step-in", "Clearances"] for e in event_types) # 공격 이벤트
+        has_attack = any(e.get("event_name") in ["Passes", "Crosses", "Shots & Goals", "Take-on", "Step-in", "Clearances"] for e in event_types)
         has_defense = any(e.get("event_name") == defensive_action for e in event_types)
 
         return has_attack and has_defense
@@ -578,7 +571,7 @@ def _parse_foul_event(event_types: list) -> tuple[str, str]:
     else:
         bodypart = "foot"
 
-    # foul은 여러 결과가 동시에 존재할 수 있음(경고+퇴장 등)
+    # Fouls can carry multiple outcome descriptors.
     if foul_outcome == "Red Cards":
         result = "red_card"
     elif foul_outcome == "Yellow Cards":

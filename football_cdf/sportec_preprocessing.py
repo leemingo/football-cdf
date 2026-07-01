@@ -210,7 +210,7 @@ class SportecDataPreprocessor(BaseEventTrackingPreprocessor):
         }
 
         def _parse_play_or_shot(element):
-            """Play/ShotAtGoal 엘리먼트를 파싱하여 (event_type, attrs) 반환."""
+            """Parse a Play/ShotAtGoal element into ``(event_type, attrs)``."""
             attrs = dict(element.attrib)
 
             if element.tag == "Play":

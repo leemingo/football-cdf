@@ -9,12 +9,7 @@ import pandas as pd
 
 from .base import BaseEventTrackingPreprocessor
 from .constants import CDF_PERIOD_MAP, PITCH_X, PITCH_Y
-from .skillcorner_api import (
-    META_FILENAMES,
-    SkillcornerClient,
-    SkillcornerCredentials,
-    find_match_dir,
-)
+from .skillcorner_paths import META_FILENAMES, find_match_dir
 
 
 SKILLCORNER_POSITION_MAPPING = {
@@ -61,22 +56,10 @@ class SkillcornerDataPreprocessor(BaseEventTrackingPreprocessor):
         root_dir: str,
         match_id: str,
         load_tracking: bool = False,
-        *,
-        auto_download: bool = False,
-        client: SkillcornerClient | None = None,
-        credentials: SkillcornerCredentials | None = None,
-        overwrite_download: bool = False,
     ):
         super().__init__()
         self.match_id = str(match_id)
-        self.match_path = self._locate_match_path(
-            root_dir,
-            self.match_id,
-            auto_download=auto_download,
-            client=client,
-            credentials=credentials,
-            overwrite=overwrite_download,
-        )
+        self.match_path = self._locate_match_path(root_dir, self.match_id)
 
         self.meta_path = self._resolve_existing_file(self.match_path, self.META_FILENAMES)
         self.event_path = self.match_path / self.EVENT_FILENAME
@@ -105,25 +88,16 @@ class SkillcornerDataPreprocessor(BaseEventTrackingPreprocessor):
         cls,
         root_dir: str,
         match_id: str,
-        *,
-        auto_download: bool,
-        client: SkillcornerClient | None,
-        credentials: SkillcornerCredentials | None,
-        overwrite: bool,
     ) -> Path:
-        existing = find_match_dir(root_dir, match_id) if not overwrite else None
+        existing = find_match_dir(root_dir, match_id)
         if existing is not None:
             return existing
 
-        if not auto_download:
-            raise FileNotFoundError(
-                f"Could not find a SkillCorner match directory for match_id={match_id!r} "
-                f"under {root_dir}. Pass auto_download=True to fetch from the API."
-            )
-
-        api_client = client or SkillcornerClient(credentials=credentials)
-        Path(root_dir).mkdir(parents=True, exist_ok=True)
-        return api_client.download_match(match_id=match_id, root=root_dir, overwrite=overwrite)
+        raise FileNotFoundError(
+            f"Could not find a local SkillCorner match directory for match_id={match_id!r} "
+            f"under {root_dir}. Download SkillCorner Open Data or point root_dir at a "
+            "local match-bundle directory."
+        )
 
     @staticmethod
     def _resolve_existing_file(match_path: Path, candidates: Iterable[str]) -> Path:

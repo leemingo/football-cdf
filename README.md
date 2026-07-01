@@ -1,30 +1,102 @@
 # football-cdf
 
-Shared preprocessing that converts provider raw event + tracking feeds into a
-**common data format (CDF)**. Single source of truth, consumed by multiple
-projects (e.g. `player-aware-epv`, `football-analytics`) as a **git submodule**
-+ editable install.
+`football-cdf` contains shared preprocessing utilities for converting provider
+raw event and tracking feeds into the **Common Data Format (CDF)** described in
+[Anzer et al., "Common Data Format (CDF): A Standardized Format for Match-Data
+in Football (Soccer)"](https://arxiv.org/abs/2505.15820).
 
-## Providers
-- **SkillCorner** — `football_cdf.skillcorner_preprocessing.SkillcornerDataPreprocessor` (+ `skillcorner_api`)
-- **Bepro** — `football_cdf.bepro_preprocessing.BeproDataPreprocessor` (+ `bepro_actions`)
-- **Sportec / DFL** — `football_cdf.sportec_preprocessing.SportecDataPreprocessor`
-- `base.BaseEventTrackingPreprocessor` (shared CDF logic), `constants` (`CDF_PERIOD_MAP`, `PITCH_X/Y`)
+In `open-football-analytics`, this submodule provides the preprocessing layer
+used before metric workflows such as xG, xPass, and xT.
 
-## Install (editable — shared across projects)
+## Provider Support
+
+| Provider | Main class / module | Notes |
+|---|---|---|
+| SkillCorner | `football_cdf.skillcorner_preprocessing.SkillcornerDataPreprocessor` | Metadata, lineup, Dynamic Events helpers, and tracking JSONL parsing. |
+| Sportec / DFL | `football_cdf.sportec_preprocessing.SportecDataPreprocessor` | Event and tracking conversion for already-extracted raw folders. |
+| Bepro | `football_cdf.bepro_preprocessing.BeproDataPreprocessor` | Provider parser utilities. |
+| Shared CDF logic | `football_cdf.base.BaseEventTrackingPreprocessor` | Common event/tracking schema helpers. |
+
+## Public Tutorial
+
+The public notebook is:
+
+```text
+notebooks/provider_to_cdf.ipynb
+```
+
+It demonstrates:
+
+- SkillCorner Open Data file layout
+- conversion into the match-bundle layout expected by
+  `SkillcornerDataPreprocessor`
+- SkillCorner tracking JSONL to wide CDF tracking
+- Sportec raw folder loading when the Sportec files are already extracted
+
+The notebook intentionally uses placeholder paths and public-data assumptions.
+
+## SkillCorner Open Data Layout
+
+The tutorial expects the SkillCorner Open Data repository layout:
+
+```text
+path/to/SkillCorner/opendata/data/matches/{match_id}/
+  {match_id}_match.json
+  {match_id}_dynamic_events.csv
+  {match_id}_tracking_extrapolated.jsonl
+```
+
+The helper in the notebook creates a normalized match bundle:
+
+```text
+/path/to/cdf-work/{match_id}/
+  match.json
+  dynamic_events.csv
+  tracking.jsonl
+```
+
+## Sportec Layout
+
+Sportec examples assume the raw files are already extracted:
+
+```text
+path/to/dfl-spoho/raw/{match_id}/
+```
+
+Point `SPORTEC_ROOT` at the raw root and `SPORTEC_MATCH` at the match folder
+name.
+
+## Install
+
+When working from the parent `open-football-analytics` repository, install the
+parent package in editable mode:
+
+```bash
+pip install -e ".[models,notebooks]"
+```
+
+When using `football-cdf` independently:
+
 ```bash
 pip install -e /path/to/football-cdf
 python -c "from football_cdf.skillcorner_preprocessing import SkillcornerDataPreprocessor; print('ok')"
 ```
 
-## Use as a submodule in another repo
+## Use As A Submodule
+
 ```bash
 git submodule add <football-cdf remote/url> football-cdf
 pip install -e ./football-cdf
-# clone later:  git clone --recurse-submodules <superproject>
-# update:       git submodule update --remote football-cdf
 ```
 
-Edit the code **here** (in any project's `football-cdf/` submodule checkout),
-commit + push, then `git submodule update --remote football-cdf` in the other
-projects to pull the change.
+Clone later with:
+
+```bash
+git clone --recurse-submodules <superproject>
+```
+
+Update the submodule with:
+
+```bash
+git submodule update --remote football-cdf
+```

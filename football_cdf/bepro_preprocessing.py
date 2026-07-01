@@ -647,7 +647,7 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
                 # "Tackle" (70) + "Intervention" (55). Map Intervention to a
                 # v1 "Tackles" entry so totals match. Drive carries no outcome
                 # for interventions, so default to a failed tackle (matches how
-                # v1 encodes these on the cross-validated match 126306).
+                # v1 encodes these as failed tackles in validated samples).
                 out.append({"event_name": "Tackles", "property": {"Outcome": "Failed"}})
             elif t in cls._V2_SIMPLE_EVENT_NAME:
                 out.append({"event_name": cls._V2_SIMPLE_EVENT_NAME[t], "property": {}})
@@ -1049,7 +1049,7 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         total_tracking_df = total_tracking_df[final_cols_order]
 
         # determine ball owning team at each frame
-        #ball_owning_team_id: bepro_precessor.py 참고
+        # Determine the ball-owning team from the provider tracking signal.
         g = total_tracking_df.groupby(['period_id', 'timestamp', 'frame_id'])
         ball_state = pd.DataFrame({
             "ball_state": g["ball_state"].apply(lambda s: s.value_counts().idxmax()),
@@ -1077,7 +1077,7 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         total_tracking_df.loc[total_tracking_df['ball_x'].isna() | total_tracking_df['ball_y'].isna(), 'ball_state'] = 'dead'
         total_tracking_df.loc[total_tracking_df['ball_x'].isna() | total_tracking_df['ball_y'].isna(), 'ball_owning_team_id'] = pd.NA
     
-        # timestamp: milliseconds) -> timestamp(seconds): 초 단위로 변횐
+        # Convert timestamps from milliseconds to seconds.
         total_tracking_df['timestamp'] = (
             total_tracking_df['timestamp'].dt.total_seconds()
             - ((total_tracking_df.period_id > 1) * 45 * 60)
@@ -2550,7 +2550,7 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         halftime_assumption_minutes: float = DEFAULT_HALFTIME_ASSUMPTION_MINUTES,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         tracking = self.tracking.copy()
-        tracking = tracking.drop(columns=["frame_id"]) # elastic 형태에 맞게 재변형
+        tracking = tracking.drop(columns=["frame_id"])
 
         if "frame_id" not in tracking.columns or "utc_timestamp" not in tracking.columns:
             tracking = BaseEventTrackingPreprocessor.calculate_tracking_datetimes(events=None, tracking=tracking, fps=self.target_fps)
