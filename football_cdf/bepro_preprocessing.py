@@ -10,7 +10,14 @@ from .base import BaseEventTrackingPreprocessor
 from .bepro_actions import convert_to_actions
 from .constants import CDF_PERIOD_MAP, PITCH_X, PITCH_Y
 
-pd.set_option('future.no_silent_downcasting', True)
+# Pandas 2.x exposes the future behavior behind an option. It is already the
+# default in Pandas 3+, where setting the option emits a deprecation warning.
+if int(pd.__version__.split(".", maxsplit=1)[0]) < 3:
+    try:
+        pd.set_option("future.no_silent_downcasting", True)
+    except pd.errors.OptionError:
+        pass
+
 
 class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
     DEFAULT_HALFTIME_ASSUMPTION_MINUTES = 15.0
@@ -1249,21 +1256,54 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         return total_resampled_df
 
     @staticmethod
-    def align_event_identifier(lineup: pd.DataFrame, events: pd.DataFrame, match_id: int) -> pd.DataFrame:
+    def align_event_identifier(
+        lineup: pd.DataFrame,
+        events: pd.DataFrame,
+        match_id: int,
+    ) -> pd.DataFrame:
+        events = events.copy()
+
+        player_name_to_id = (
+            lineup.dropna(subset=["player_name", "player_id"])
+            .drop_duplicates("player_name")
+            .set_index("player_name")["player_id"]
+            .to_dict()
+        )
         if "player_id" not in events.columns:
-            player_name_to_id = lineup.set_index("player_name")["player_id"].to_dict()
             events["player_id"] = events["player_name"].map(player_name_to_id)
-        
+        elif "player_name" in events.columns:
+            events["player_id"] = events["player_id"].fillna(
+                events["player_name"].map(player_name_to_id)
+            )
+
+        # Some v1 extracts contain a team_id column whose values are all null.
+        # Treat those values as missing and recover them from the lineup instead
+        # of checking only whether the column itself exists.
+        player_id_to_team_id = (
+            lineup.dropna(subset=["player_id", "team_id"])
+            .assign(player_id=lambda frame: frame["player_id"].astype("string"))
+            .drop_duplicates("player_id")
+            .set_index("player_id")["team_id"]
+            .astype("string")
+            .to_dict()
+        )
+        mapped_team_ids = events["player_id"].astype("string").map(player_id_to_team_id)
         if "team_id" not in events.columns:
-            player_id_to_team_id = lineup.set_index("player_id")["team_id"].to_dict()
-            events["team_id"] = events["player_id"].map(player_id_to_team_id)
-        
+            events["team_id"] = mapped_team_ids
+        else:
+            events["team_id"] = events["team_id"].astype("string").fillna(mapped_team_ids)
+
         if "match_id" not in events.columns:
             events["match_id"] = match_id
+        else:
+            events["match_id"] = events["match_id"].fillna(match_id)
 
         if "event_id" not in events.columns:
-            events["event_id"] = events.apply(lambda ets: f"{ets.match_id}_{ets.period_id}_{ets.name}", axis=1)
-        
+            events["event_id"] = events.apply(
+                lambda event: f"{event.match_id}_{event.period_id}_{event.name}",
+                axis=1,
+            )
+
         return events
 
     @staticmethod
