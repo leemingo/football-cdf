@@ -12,6 +12,8 @@ __all__ = [
     "SkillcornerDataPreprocessor",
     "SportecDataPreprocessor",
     "StatsbombDataPreprocessor",
+    "HudlStatsbombDataPreprocessor",
+    "HudlTrackingDataPreprocessor",
     "find_match_dir",
     "resolve_statsbomb_data_root",
     "resolve_statsbomb_match_paths",
@@ -35,4 +37,12 @@ def __getattr__(name: str):
         from .statsbomb_preprocessing import StatsbombDataPreprocessor
 
         return StatsbombDataPreprocessor
+    if name == "HudlStatsbombDataPreprocessor":
+        from .hudl_statsbomb_preprocessing import HudlStatsbombDataPreprocessor
+
+        return HudlStatsbombDataPreprocessor
+    if name == "HudlTrackingDataPreprocessor":
+        from .hudl_tracking_preprocessing import HudlTrackingDataPreprocessor
+
+        return HudlTrackingDataPreprocessor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

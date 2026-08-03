@@ -28,6 +28,8 @@ used before metric workflows such as xG, xPass, and xT.
 | SkillCorner | `football_cdf.skillcorner_preprocessing.SkillcornerDataPreprocessor` | Metadata, lineup, Dynamic Events helpers, and tracking JSONL parsing. |
 | Sportec / DFL | `football_cdf.sportec_preprocessing.SportecDataPreprocessor` | Event conversion, Kloppy-backed tracking loading/normalization, and SPADL-style action conversion for already-extracted raw folders. |
 | StatsBomb Open Data | `football_cdf.statsbomb_preprocessing.StatsbombDataPreprocessor` | Metadata, lineup, CDF-aligned events, SPADL-style actions, and event-linked 360 context. StatsBomb 360 is not treated as continuous tracking. |
+| Hudl flattened StatsBomb | `football_cdf.hudl_statsbomb_preprocessing.HudlStatsbombDataPreprocessor` | One flattened event JSON export to CDF/SPADL and event-linked 360 context. Continuous tracking is intentionally out of scope. |
+| Hudl Tracking v2 | `football_cdf.hudl_tracking_preprocessing.HudlTrackingDataPreprocessor` | Paired flattened events and tracking JSONL to source-scale, home-left CDF-style tracking. In-play state and possession remain missing because the provider does not expose them. |
 | Shared CDF logic | `football_cdf.base.BaseEventTrackingPreprocessor` | Common event/tracking schema helpers. |
 
 ## Public Tutorial
@@ -137,6 +139,48 @@ vocabulary. A StatsBomb interception pass is split into interception and pass
 actions; set `split_interception_passes=False` to keep only its pass action.
 No synthetic between-event dribbles are inserted because StatsBomb already
 provides explicit `Carry` events.
+
+## Hudl Flattened StatsBomb Events
+
+For a Hudl export that stores StatsBomb fields as dotted keys in a single JSON
+event array, pass the event file directly. The adapter reconstructs the
+StatsBomb event shape, derives the lineup from `Starting XI` and substitution
+events, and preserves event-linked `freeze_frame` / `visible_area` context.
+
+```python
+from football_cdf import HudlStatsbombDataPreprocessor
+
+preprocessor = HudlStatsbombDataPreprocessor("/path/to/hudl-events.json")
+events_cdf = preprocessor.preprocess_cdf_events(preserve_raw_columns=True)
+actions = preprocessor.preprocess_spadl_events(events_cdf)
+frames_360, objects_360 = preprocessor.preprocess_360_data()
+```
+
+This adapter does not parse or align continuous tracking files; those require
+a separate event--tracking alignment implementation.
+
+## Hudl Tracking v2
+
+Use the paired event and tracking paths for the same match. The adapter checks
+date, teams, and score before loading. It keeps the raw coordinate scale and
+only applies a 180-degree rotation per period when necessary to keep the home
+team on the left. It does not infer pitch dimensions, player IDs that cannot be
+resolved from a Starting XI jersey, possession, or in-play status.
+
+```python
+from football_cdf import HudlTrackingDataPreprocessor
+
+preprocessor = HudlTrackingDataPreprocessor(
+    "/path/to/hudl-events.json",
+    "/path/to/hudl-tracking.jsonl",
+)
+raw_tracking, input_tracking = preprocessor.preprocess_tracking_data()
+```
+
+`input_tracking` contains frames with 11 observed players for each team; it is
+not a provider-confirmed in-play subset. `ball_status` and
+`ball_poss_team_id` are missing by design. Source time, coordinates, kinematics,
+visibility, and confidence are retained with a `source_` prefix.
 
 ## Install
 
