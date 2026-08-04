@@ -7,9 +7,11 @@ identifier.  This adapter therefore preserves a stable side-and-jersey
 provides an exact shirt-number match.
 
 The source does not declare pitch dimensions, a pitch orientation, possession,
-or an in-play flag.  Coordinates retain their source scale; only a per-period
-180-degree rotation is applied so the home team is on the left.  Unknown game
-state fields remain missing in the CDF outputs.
+or an in-play flag.  Coordinates retain their source scale by default; only a
+per-period 180-degree rotation is applied so the home team is on the left.
+Callers can supply separately provided physical pitch dimensions to normalize
+coordinates to the shared 105 x 68 metre CDF reference. Unknown game-state
+fields remain missing in the CDF outputs.
 """
 from __future__ import annotations
 
@@ -24,6 +26,80 @@ import pandas as pd
 
 from .constants import CDF_PERIOD_MAP
 from .hudl_statsbomb_preprocessing import HudlStatsbombDataPreprocessor
+
+
+CANONICAL_PITCH_LENGTH_M = 105.0
+CANONICAL_PITCH_WIDTH_M = 68.0
+
+
+def load_hudl_pitch_dimensions(path: str | Path) -> dict[str, tuple[float, float]]:
+    """Load Hudl companion pitch dimensions keyed by tracking match ID.
+
+    The provider companion file uses ``wyscout_match_id`` for the tracking
+    match ID and calls pitch width ``pitch_height_m``. The data file itself is
+    intentionally external to this package; this helper only validates and
+    parses its documented schema.
+    """
+    with Path(path).open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, list):
+        raise ValueError(f"Pitch-dimensions file must contain a JSON list: {path}")
+
+    dimensions: dict[str, tuple[float, float]] = {}
+    for row_number, row in enumerate(payload, 1):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"Pitch-dimensions row {row_number} is not an object")
+        try:
+            match_id = str(row["wyscout_match_id"])
+            length_m = float(row["pitch_length_m"])
+            width_m = float(row["pitch_height_m"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"Pitch-dimensions row {row_number} must provide "
+                "wyscout_match_id, pitch_length_m, and pitch_height_m"
+            ) from error
+        if not np.isfinite(length_m) or not np.isfinite(width_m) or length_m <= 0 or width_m <= 0:
+            raise ValueError(f"Invalid pitch dimensions for tracking match {match_id}: {length_m} x {width_m}")
+        if match_id in dimensions:
+            raise ValueError(f"Duplicate tracking match ID in pitch-dimensions file: {match_id}")
+        dimensions[match_id] = (length_m, width_m)
+    return dimensions
+
+
+def normalize_hudl_tracking_coordinates(
+    tracking: pd.DataFrame,
+    *,
+    source_pitch_length_m: float,
+    source_pitch_width_m: float,
+    target_pitch_length_m: float = CANONICAL_PITCH_LENGTH_M,
+    target_pitch_width_m: float = CANONICAL_PITCH_WIDTH_M,
+) -> pd.DataFrame:
+    """Scale centre-origin Hudl tracking coordinates to a target pitch size.
+
+    This function rescales only the active CDF ``x``/``y`` coordinates. Raw
+    provider fields such as ``source_x`` and ``source_y`` are preserved, so
+    callers can audit the transformation. Orientation is handled separately
+    by :class:`HudlTrackingDataPreprocessor` before this function is called.
+    """
+    source_pitch_length_m = float(source_pitch_length_m)
+    source_pitch_width_m = float(source_pitch_width_m)
+    target_pitch_length_m = float(target_pitch_length_m)
+    target_pitch_width_m = float(target_pitch_width_m)
+    values = (
+        source_pitch_length_m,
+        source_pitch_width_m,
+        target_pitch_length_m,
+        target_pitch_width_m,
+    )
+    if not all(np.isfinite(value) and value > 0 for value in values):
+        raise ValueError("Source and target pitch dimensions must be finite positive values")
+    if not {"x", "y"}.issubset(tracking.columns):
+        raise ValueError("Tracking table must contain x and y columns")
+
+    output = tracking.copy()
+    output["x"] = pd.to_numeric(output["x"], errors="coerce") * target_pitch_length_m / source_pitch_length_m
+    output["y"] = pd.to_numeric(output["y"], errors="coerce") * target_pitch_width_m / source_pitch_width_m
+    return output
 
 
 class HudlTrackingDataPreprocessor(HudlStatsbombDataPreprocessor):
@@ -378,19 +454,50 @@ class HudlTrackingDataPreprocessor(HudlStatsbombDataPreprocessor):
     def preprocess_tracking_data(
         self,
         apply_kinematic_correction: bool = False,
+        *,
+        source_pitch_length_m: float | None = None,
+        source_pitch_width_m: float | None = None,
+        target_pitch_length_m: float = CANONICAL_PITCH_LENGTH_M,
+        target_pitch_width_m: float = CANONICAL_PITCH_WIDTH_M,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Return all observed tracking and complete-team candidate frames.
 
         ``ball_status`` and ``ball_poss_team_id`` remain missing in both
         outputs.  The second output is filtered only by the agreed 11-v-11
         geometric completeness criterion, not by an unavailable in-play flag.
+
+        By default, coordinates retain the provider source scale. To normalize
+        to a target pitch (105 x 68 m by default), provide both source physical
+        pitch dimensions. The source and target coordinates are centre-origin,
+        and raw provider ``source_x``/``source_y`` fields remain available for
+        audit.
         """
+        if (source_pitch_length_m is None) != (source_pitch_width_m is None):
+            raise ValueError("source_pitch_length_m and source_pitch_width_m must be provided together")
         raw_tracking, _ = self._finalize_tracking_output(
             self.tracking,
             fps=self.fps,
             apply_kinematic_correction=apply_kinematic_correction,
         )
         raw_tracking = self._attach_source_fields(raw_tracking)
+        if source_pitch_length_m is not None and source_pitch_width_m is not None:
+            raw_tracking = normalize_hudl_tracking_coordinates(
+                raw_tracking,
+                source_pitch_length_m=source_pitch_length_m,
+                source_pitch_width_m=source_pitch_width_m,
+                target_pitch_length_m=target_pitch_length_m,
+                target_pitch_width_m=target_pitch_width_m,
+            )
+            self.match_metadata.update(
+                {
+                    "tracking_source_pitch_length": float(source_pitch_length_m),
+                    "tracking_source_pitch_width": float(source_pitch_width_m),
+                    "tracking_coordinate_scale_verified": True,
+                    "tracking_coordinate_orientation": "home_left_rotated_normalized",
+                    "tracking_target_pitch_length": float(target_pitch_length_m),
+                    "tracking_target_pitch_width": float(target_pitch_width_m),
+                }
+            )
         # Base finalization maps the internal "unknown" sentinel to NaN. Keep
         # the public CDF game-state fields explicitly missing.
         raw_tracking["ball_status"] = pd.Series(pd.NA, index=raw_tracking.index, dtype="boolean")

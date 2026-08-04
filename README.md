@@ -29,7 +29,7 @@ used before metric workflows such as xG, xPass, and xT.
 | Sportec / DFL | `football_cdf.sportec_preprocessing.SportecDataPreprocessor` | Event conversion, Kloppy-backed tracking loading/normalization, and SPADL-style action conversion for already-extracted raw folders. |
 | StatsBomb Open Data | `football_cdf.statsbomb_preprocessing.StatsbombDataPreprocessor` | Metadata, lineup, CDF-aligned events, SPADL-style actions, and event-linked 360 context. StatsBomb 360 is not treated as continuous tracking. |
 | Hudl flattened StatsBomb | `football_cdf.hudl_statsbomb_preprocessing.HudlStatsbombDataPreprocessor` | One flattened event JSON export to CDF/SPADL and event-linked 360 context. Continuous tracking is intentionally out of scope. |
-| Hudl Tracking v2 | `football_cdf.hudl_tracking_preprocessing.HudlTrackingDataPreprocessor` | Paired flattened events and tracking JSONL to source-scale, home-left CDF-style tracking. In-play state and possession remain missing because the provider does not expose them. |
+| Hudl Tracking v2 | `football_cdf.hudl_tracking_preprocessing.HudlTrackingDataPreprocessor` | Paired flattened events and tracking JSONL to home-left CDF-style tracking. Source scale is retained by default and can be normalized with separately supplied physical pitch dimensions. In-play state and possession remain missing because the provider does not expose them. |
 | Shared CDF logic | `football_cdf.base.BaseEventTrackingPreprocessor` | Common event/tracking schema helpers. |
 
 ## Public Tutorial
@@ -162,25 +162,34 @@ a separate event--tracking alignment implementation.
 ## Hudl Tracking v2
 
 Use the paired event and tracking paths for the same match. The adapter checks
-date, teams, and score before loading. It keeps the raw coordinate scale and
-only applies a 180-degree rotation per period when necessary to keep the home
-team on the left. It does not infer pitch dimensions, player IDs that cannot be
-resolved from a Starting XI jersey, possession, or in-play status.
+date, teams, and score before loading. It keeps the raw coordinate scale by
+default and only applies a 180-degree rotation per period when necessary to
+keep the home team on the left. If separately supplied physical dimensions are
+available, use the companion-file helper and pass the resolved dimensions to
+normalize tracking coordinates to the canonical 105 x 68 m reference. The
+adapter does not infer pitch dimensions, player IDs that cannot be resolved
+from a Starting XI jersey, possession, or in-play status.
 
 ```python
-from football_cdf import HudlTrackingDataPreprocessor
+from football_cdf import HudlTrackingDataPreprocessor, load_hudl_pitch_dimensions
 
 preprocessor = HudlTrackingDataPreprocessor(
     "/path/to/hudl-events.json",
     "/path/to/hudl-tracking.jsonl",
 )
-raw_tracking, input_tracking = preprocessor.preprocess_tracking_data()
+dimensions = load_hudl_pitch_dimensions("/path/to/provider-pitch-dimensions.json")
+source_pitch_length_m, source_pitch_width_m = dimensions[preprocessor.tracking_match_id]
+raw_tracking, input_tracking = preprocessor.preprocess_tracking_data(
+    source_pitch_length_m=source_pitch_length_m,
+    source_pitch_width_m=source_pitch_width_m,
+)
 ```
 
 `input_tracking` contains frames with 11 observed players for each team; it is
 not a provider-confirmed in-play subset. `ball_status` and
 `ball_poss_team_id` are missing by design. Source time, coordinates, kinematics,
-visibility, and confidence are retained with a `source_` prefix.
+visibility, and confidence are retained with a `source_` prefix. The provider
+companion dimensions file remains external to this public package.
 
 ## Install
 

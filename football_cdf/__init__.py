@@ -14,6 +14,8 @@ __all__ = [
     "StatsbombDataPreprocessor",
     "HudlStatsbombDataPreprocessor",
     "HudlTrackingDataPreprocessor",
+    "load_hudl_pitch_dimensions",
+    "normalize_hudl_tracking_coordinates",
     "find_match_dir",
     "resolve_statsbomb_data_root",
     "resolve_statsbomb_match_paths",
@@ -45,4 +47,14 @@ def __getattr__(name: str):
         from .hudl_tracking_preprocessing import HudlTrackingDataPreprocessor
 
         return HudlTrackingDataPreprocessor
+    if name in {"load_hudl_pitch_dimensions", "normalize_hudl_tracking_coordinates"}:
+        from .hudl_tracking_preprocessing import (
+            load_hudl_pitch_dimensions,
+            normalize_hudl_tracking_coordinates,
+        )
+
+        return {
+            "load_hudl_pitch_dimensions": load_hudl_pitch_dimensions,
+            "normalize_hudl_tracking_coordinates": normalize_hudl_tracking_coordinates,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
