@@ -3,8 +3,10 @@
 Hudl's tracking export is a single JSONL file per match.  It supplies player
 coordinates by home/away side and shirt number rather than a provider player
 identifier.  This adapter therefore preserves a stable side-and-jersey
-``object_id`` and only assigns an event ``player_id`` when the event lineup
-provides an exact shirt-number match.
+``object_id``.  When supplied, Hudl's companion roster mapping is the
+authoritative ``side + jersey -> event player_id`` source and covers both
+starters and substitutes; without it, the adapter falls back to the event
+Starting XI only.
 
 The source does not declare pitch dimensions, a pitch orientation, possession,
 or an in-play flag.  Coordinates retain their source scale by default; only a
@@ -18,6 +20,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +33,107 @@ from .hudl_statsbomb_preprocessing import HudlStatsbombDataPreprocessor
 
 CANONICAL_PITCH_LENGTH_M = 105.0
 CANONICAL_PITCH_WIDTH_M = 68.0
+
+
+@dataclass(frozen=True)
+class HudlMatchPlayerIdMapping:
+    """Provider-supplied roster identity mapping for one Hudl match.
+
+    ``player_ids`` and ``player_names`` are keyed by ``(home_away,
+    jersey_number)``.  The event and tracking identifiers are retained so a
+    caller cannot accidentally apply a roster from another match.
+    """
+
+    tracking_match_id: str
+    event_match_id: str
+    player_ids: dict[tuple[str, str], str]
+    player_names: dict[tuple[str, str], str]
+
+
+def _canonical_jersey_number(value: object) -> str:
+    """Return a stable string form for a numeric shirt number."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid Hudl jersey number: {value!r}") from error
+    if not np.isfinite(numeric) or not numeric.is_integer() or numeric < 0:
+        raise ValueError(f"Invalid Hudl jersey number: {value!r}")
+    return str(int(numeric))
+
+
+def load_hudl_player_id_mapping(path: str | Path) -> dict[str, HudlMatchPlayerIdMapping]:
+    """Load Hudl's final ``side + jersey -> StatsBomb player ID`` file.
+
+    The companion JSON is keyed by ``wyscout_match_id`` (the tracking match
+    identifier) and contains ``sbd_game_id`` (the event match identifier),
+    plus home and away roster lists.  Its StatsBomb player IDs are expected to
+    match ``player.id`` in the paired Hudl event export.
+    """
+    with Path(path).open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, list):
+        raise ValueError(f"Player-ID mapping file must contain a JSON list: {path}")
+
+    mappings: dict[str, HudlMatchPlayerIdMapping] = {}
+    event_match_ids: set[str] = set()
+    for row_number, row in enumerate(payload, 1):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"Player-ID mapping row {row_number} is not an object")
+        try:
+            tracking_match_id = str(row["wyscout_match_id"])
+            event_match_id = str(row["sbd_game_id"])
+        except KeyError as error:
+            raise ValueError(
+                f"Player-ID mapping row {row_number} must provide "
+                "wyscout_match_id and sbd_game_id"
+            ) from error
+        if tracking_match_id in mappings:
+            raise ValueError(f"Duplicate tracking match ID in player-ID mapping: {tracking_match_id}")
+        if event_match_id in event_match_ids:
+            raise ValueError(f"Duplicate event match ID in player-ID mapping: {event_match_id}")
+
+        player_ids: dict[tuple[str, str], str] = {}
+        player_names: dict[tuple[str, str], str] = {}
+        for side in ("home", "away"):
+            roster = row.get(side)
+            if not isinstance(roster, list):
+                raise ValueError(f"Player-ID mapping row {row_number} has no {side} roster list")
+            for player_number, player in enumerate(roster, 1):
+                if not isinstance(player, Mapping):
+                    raise ValueError(
+                        f"Player-ID mapping row {row_number} {side} player {player_number} is not an object"
+                    )
+                try:
+                    jersey = _canonical_jersey_number(player["jersey_num"])
+                    player_id = str(player["sb_player_id"])
+                except KeyError as error:
+                    raise ValueError(
+                        f"Player-ID mapping row {row_number} {side} player {player_number} must provide "
+                        "jersey_num and sb_player_id"
+                    ) from error
+                if not player_id or player_id.lower() == "none":
+                    raise ValueError(
+                        f"Player-ID mapping row {row_number} {side} player {player_number} has an invalid sb_player_id"
+                    )
+                key = (side, jersey)
+                if key in player_ids:
+                    raise ValueError(
+                        f"Duplicate {side} jersey {jersey} in player-ID mapping for tracking match {tracking_match_id}"
+                    )
+                player_ids[key] = player_id
+                name = player.get("sb_player_name")
+                if name is not None and str(name).strip():
+                    player_names[key] = str(name)
+        if not player_ids:
+            raise ValueError(f"Player-ID mapping row {row_number} has no players")
+        mappings[tracking_match_id] = HudlMatchPlayerIdMapping(
+            tracking_match_id=tracking_match_id,
+            event_match_id=event_match_id,
+            player_ids=player_ids,
+            player_names=player_names,
+        )
+        event_match_ids.add(event_match_id)
+    return mappings
 
 
 def load_hudl_pitch_dimensions(path: str | Path) -> dict[str, tuple[float, float]]:
@@ -131,6 +235,7 @@ class HudlTrackingDataPreprocessor(HudlStatsbombDataPreprocessor):
         tracking_path: str,
         *,
         required_players_per_team: int = 11,
+        player_id_mapping: Mapping[str, HudlMatchPlayerIdMapping] | None = None,
     ):
         super().__init__(event_path)
         if required_players_per_team != 11:
@@ -141,6 +246,9 @@ class HudlTrackingDataPreprocessor(HudlStatsbombDataPreprocessor):
         self.raw_tracking_header = self.load_tracking_header(self.tracking_path)
         self._validate_tracking_match(self.raw_tracking_header)
         self.tracking_match_id = str(self.raw_tracking_header["metadata"]["matchId"])
+        self.player_id_mapping = self._resolve_player_id_mapping(player_id_mapping)
+        if self.player_id_mapping is not None:
+            self._apply_player_id_mapping(self.player_id_mapping)
         self.match_metadata.update(
             {
                 "tracking_match_id": self.tracking_match_id,
@@ -222,6 +330,109 @@ class HudlTrackingDataPreprocessor(HudlStatsbombDataPreprocessor):
                 f"tracking={tracking_date} {home} vs {away} {home_score}-{away_score}"
             )
 
+    def _resolve_player_id_mapping(
+        self,
+        mappings: Mapping[str, HudlMatchPlayerIdMapping] | None,
+    ) -> HudlMatchPlayerIdMapping | None:
+        if mappings is None:
+            return None
+        mapping = mappings.get(self.tracking_match_id)
+        if mapping is None:
+            raise ValueError(
+                "No player-ID mapping for Hudl tracking match "
+                f"{self.tracking_match_id}; do not fall back to a starter-only identity map."
+            )
+        if str(mapping.event_match_id) != str(self.match_id):
+            raise ValueError(
+                "Hudl player-ID mapping identifies a different event match: "
+                f"tracking={self.tracking_match_id}, mapping event={mapping.event_match_id}, "
+                f"loaded event={self.match_id}"
+            )
+        return mapping
+
+    def _apply_player_id_mapping(self, mapping: HudlMatchPlayerIdMapping) -> None:
+        """Enrich the event-derived lineup with Hudl's complete roster map.
+
+        Starting-XI jersey numbers are cross-checked against the provider map.
+        Substitutes obtain their true jersey/object ID here rather than the
+        event adapter's intentionally unstable ``side_<player_id>`` fallback.
+        Extra roster entries are retained so every tracked side-and-jersey
+        object can carry its event player ID, even if the player has no action.
+        """
+        lineup = self.lineup.copy()
+        side_team: dict[str, tuple[object, object]] = {}
+        for side in ("home", "away"):
+            side_rows = lineup.loc[lineup["home_away"].astype("string").eq(side)]
+            if side_rows.empty:
+                raise ValueError(f"Hudl event lineup has no {side} team")
+            team_ids = side_rows["team_id"].dropna().astype(str).unique()
+            team_names = side_rows["team_name"].dropna().unique()
+            if len(team_ids) != 1:
+                raise ValueError(f"Hudl event lineup has ambiguous {side} team IDs")
+            side_team[side] = (team_ids[0], team_names[0] if len(team_names) else pd.NA)
+
+        # Validate every event lineup jersey that is actually supplied.
+        for row in lineup.loc[lineup["uniform_number"].notna()].itertuples(index=False):
+            side = str(row.home_away)
+            key = (side, _canonical_jersey_number(row.uniform_number))
+            mapped_player_id = mapping.player_ids.get(key)
+            if mapped_player_id is None:
+                raise ValueError(f"Player-ID mapping lacks event lineup jersey {key}")
+            if str(row.player_id) != mapped_player_id:
+                raise ValueError(
+                    "Player-ID mapping conflicts with event Starting XI: "
+                    f"{key} maps to {mapped_player_id}, event has {row.player_id}"
+                )
+
+        player_rows = {
+            str(row.player_id): index
+            for index, row in lineup.loc[lineup["player_id"].notna()].iterrows()
+        }
+        additions: list[dict[str, Any]] = []
+        for (side, jersey), player_id in mapping.player_ids.items():
+            object_id = f"{side}_{jersey}"
+            if player_id in player_rows:
+                index = player_rows[player_id]
+                existing_side = str(lineup.at[index, "home_away"])
+                if existing_side != side:
+                    raise ValueError(
+                        f"Player {player_id} belongs to {existing_side} in events but {side} in player-ID mapping"
+                    )
+                old_jersey = lineup.at[index, "uniform_number"]
+                if pd.notna(old_jersey) and _canonical_jersey_number(old_jersey) != jersey:
+                    raise ValueError(
+                        f"Player {player_id} has event jersey {old_jersey} but mapping jersey {jersey}"
+                    )
+                lineup.at[index, "uniform_number"] = int(jersey)
+                lineup.at[index, "object_id"] = object_id
+                if pd.isna(lineup.at[index, "player_name"]) and (side, jersey) in mapping.player_names:
+                    lineup.at[index, "player_name"] = mapping.player_names[(side, jersey)]
+                continue
+
+            team_id, team_name = side_team[side]
+            addition = {column: pd.NA for column in lineup.columns}
+            addition.update(
+                {
+                    "team_id": team_id,
+                    "team_name": team_name,
+                    "home_away": side,
+                    "player_id": player_id,
+                    "uniform_number": int(jersey),
+                    "object_id": object_id,
+                    "player_name": mapping.player_names.get((side, jersey), pd.NA),
+                    "starting": False,
+                }
+            )
+            additions.append(addition)
+
+        if additions:
+            lineup = pd.concat([lineup, pd.DataFrame(additions)], ignore_index=True, sort=False)
+        if lineup["player_id"].dropna().astype(str).duplicated().any():
+            raise ValueError("Player-ID mapping produced duplicate player IDs in the Hudl lineup")
+        if lineup["object_id"].dropna().astype(str).duplicated().any():
+            raise ValueError("Player-ID mapping produced duplicate tracking object IDs in the Hudl lineup")
+        self.lineup = lineup
+
     # ------------------------------------------------------------------
     # Streaming raw tracking loader
     # ------------------------------------------------------------------
@@ -237,7 +448,7 @@ class HudlTrackingDataPreprocessor(HudlStatsbombDataPreprocessor):
             side = str(row.home_away)
             if side not in {"home", "away"}:
                 continue
-            jersey = str(int(row.uniform_number))
+            jersey = _canonical_jersey_number(row.uniform_number)
             key = (side, jersey)
             player_id = str(row.player_id)
             if key in mapping and mapping[key] != player_id:
@@ -335,7 +546,7 @@ class HudlTrackingDataPreprocessor(HudlStatsbombDataPreprocessor):
                         jersey = observed.get("jerseyNum")
                         if jersey is None:
                             continue
-                        jersey_key = str(jersey)
+                        jersey_key = _canonical_jersey_number(jersey)
                         if jersey_key in seen_jerseys:
                             raise ValueError(
                                 f"Duplicate {side} jersey {jersey_key!r} in frame {row['frame_id']}"
