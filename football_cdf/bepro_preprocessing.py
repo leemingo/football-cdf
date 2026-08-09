@@ -88,8 +88,16 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
 
         Produces the same ``self.events`` / ``self.lineup`` / ``self.raw_metadata``
         / ``self.match_metadata`` contract as the v1 ``__init__`` so the shared
-        downstream pipeline runs unchanged. Tracking is not available in this
-        export, so it is skipped regardless of ``load_tracking``.
+        downstream pipeline runs unchanged.
+
+        This path reads the Bepro **event** Drive export, which carries no
+        ``tracking.json``; tracking is therefore skipped regardless of
+        ``load_tracking``. Bepro tracking lives in a *separate* Drive folder whose
+        ``info.json`` / ``lineup.json`` use a different API envelope **and a
+        disjoint ``player_id`` space** (verified: zero id overlap across matches
+        165299/165300/165301), so it cannot be joined to this lineup. It is loaded
+        by ``physical.providers.load_bepro_bundle`` / ``iter_bepro_tracking`` in the
+        analysis repo instead.
         """
         files = os.listdir(match_path)
 
@@ -131,11 +139,13 @@ class BeproDataPreprocessor(BaseEventTrackingPreprocessor):
         # keep home as +x and flip the away team.
         self.events = self._v2_orient_home_left(self.events)
 
-        # Tracking frames are not part of the Google-Drive export.
+        # Tracking frames are not part of the Bepro event Drive export.
         if load_tracking:
             warnings.warn(
-                "Tracking data is not available for the Bepro v2 (Google-Drive) "
-                "format; skipping tracking load.",
+                "Tracking data is not available in the Bepro v2 event (Google-Drive) "
+                "export; skipping tracking load. Bepro tracking ships in a separate "
+                "Drive folder with a disjoint player_id space and is loaded by "
+                "physical.providers (kleague-insights), not this class.",
                 stacklevel=2,
             )
      
