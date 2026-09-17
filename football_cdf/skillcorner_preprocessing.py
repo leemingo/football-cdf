@@ -151,17 +151,38 @@ class SkillcornerDataPreprocessor(BaseEventTrackingPreprocessor):
         return f"{home_away}_{number}"
 
     @staticmethod
+    def _home_team_side_by_period(raw_metadata: dict) -> dict:
+        """Map each period number to the home team's attacking side.
+
+        `home_team_side` carries no period numbers, and the provider writes it
+        in fixed period order: entry `i` is period `i + 1`. `match_periods` is
+        *not* always in that order -- 8 of 612 K League files list it as
+        [2, 1] -- so pairing the two arrays by list position gives those files
+        each half's direction swapped.
+
+        Verified against the raw tracking rather than assumed: for all eight
+        affected matches the home goalkeeper's median x in period 1 matches
+        `home_team_side[0]` and contradicts the position-paired value, while the
+        604 well-ordered files agree either way. Left unfixed, the swap survives
+        the home-relative normalisation and leaves every snapshot of both teams
+        rotated 180 degrees, so distance and angle to the attacked goal come out
+        backwards.
+        """
+        sides = raw_metadata.get("home_team_side") or []
+        return {i + 1: side for i, side in enumerate(sides)}
+
+    @staticmethod
     def _extract_period_details(raw_metadata: dict) -> dict:
         period_rows = {}
         periods = raw_metadata.get("match_periods") or []
-        home_team_side = raw_metadata.get("home_team_side") or []
+        side_by_period = SkillcornerDataPreprocessor._home_team_side_by_period(raw_metadata)
 
-        for idx, period in enumerate(periods):
+        for period in periods:
             period_id = period.get("period")
             if period_id is None:
                 continue
 
-            side_value = home_team_side[idx] if idx < len(home_team_side) else pd.NA
+            side_value = side_by_period.get(period_id, pd.NA)
             period_rows[f"period_{period_id}_name"] = period.get("name", pd.NA)
             period_rows[f"period_{period_id}_start_frame"] = period.get("start_frame", pd.NA)
             period_rows[f"period_{period_id}_end_frame"] = period.get("end_frame", pd.NA)
@@ -183,15 +204,15 @@ class SkillcornerDataPreprocessor(BaseEventTrackingPreprocessor):
     def _build_play_direction(cls, raw_metadata: dict) -> dict:
         play_direction = {}
         periods = raw_metadata.get("match_periods") or []
-        home_team_side = raw_metadata.get("home_team_side") or []
+        side_by_period = cls._home_team_side_by_period(raw_metadata)
 
-        for idx, period in enumerate(periods):
+        for period in periods:
             period_id = period.get("period")
             period_name = CDF_PERIOD_MAP.get(period_id)
             if period_name is None:
                 continue
 
-            side_value = home_team_side[idx] if idx < len(home_team_side) else pd.NA
+            side_value = side_by_period.get(period_id, pd.NA)
             cdf_direction = cls._to_cdf_play_direction(side_value)
             if pd.isna(cdf_direction):
                 continue
